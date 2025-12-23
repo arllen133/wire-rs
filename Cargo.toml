@@ -1,0 +1,3 @@
+[workspace]
+members = ["wire-bin", "wire-cli"]
+resolver = "2"
