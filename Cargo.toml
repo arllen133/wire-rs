@@ -1,3 +1,3 @@
 [workspace]
-members = ["wire-bin", "wire-cli"]
+members = ["example", "wire", "wire-build"]
 resolver = "2"

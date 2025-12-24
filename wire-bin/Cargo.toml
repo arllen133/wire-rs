@@ -1,8 +1,0 @@
-[package]
-name = "cargo-wire"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-wire-cli = { path = "../wire-cli" }
-clap = { version = "4.0", features = ["derive"] }
