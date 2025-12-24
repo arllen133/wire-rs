@@ -11,6 +11,7 @@ use syn::{File, FnArg, Item, Pat};
 pub struct ProviderArgument {
     pub name: String,
     pub ty: String,
+    pub from: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -19,6 +20,7 @@ pub struct ProviderInfo {
     pub args: Vec<ProviderArgument>,
     pub ret: String,
     pub is_result: bool,
+    pub bindings: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -147,7 +149,32 @@ fn parse_providers_from_ast(ast: &File, mod_path: &str) -> Result<Vec<ProviderIn
                                 "_".to_string()
                             };
                             let ty = pat_type.ty.to_token_stream().to_string();
-                            Some(ProviderArgument { name, ty })
+                            let from = pat_type.attrs.iter().find_map(|attr| {
+                                if attr.path().is_ident("inject") {
+                                    if let Ok(ty) = attr.parse_args::<syn::Type>() {
+                                        return Some(ty.to_token_stream().to_string());
+                                    }
+                                }
+                                if attr.path().is_ident("wire") {
+                                    if let Ok(list) = attr.meta.require_list() {
+                                        if let Ok(nested) = list.parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated) {
+                                            for meta in nested {
+                                                if let syn::Meta::NameValue(nv) = meta {
+                                                    if nv.path.is_ident("from") {
+                                                        if let syn::Expr::Lit(expr_lit) = &nv.value {
+                                                            if let syn::Lit::Str(lit) = &expr_lit.lit {
+                                                                return Some(lit.value());
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                None
+                            });
+                            Some(ProviderArgument { name, ty, from })
                         } else {
                             None
                         }
@@ -181,7 +208,16 @@ fn parse_providers_from_ast(ast: &File, mod_path: &str) -> Result<Vec<ProviderIn
                     ("()".to_string(), false)
                 };
 
-                providers.push(ProviderInfo { path, args, ret, is_result });
+                let bindings = func.attrs.iter().filter_map(|attr| {
+                    if attr.path().segments.last().map_or(false, |s| s.ident == "bind") {
+                        if let Ok(nested) = attr.parse_args::<syn::Type>() {
+                             return Some(nested.to_token_stream().to_string());
+                        }
+                    }
+                    None
+                }).collect();
+
+                providers.push(ProviderInfo { path, args, ret, is_result, bindings });
             }
         }
     }

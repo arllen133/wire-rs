@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub struct ProviderArgument {
     pub name: String,
     pub ty: String,
+    pub from: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -15,4 +16,5 @@ pub struct ProviderInfo {
     pub args: Vec<ProviderArgument>,
     pub ret: String,
     pub is_result: bool,
+    pub bindings: Vec<String>,
 }

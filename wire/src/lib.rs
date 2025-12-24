@@ -51,7 +51,19 @@ impl Parse for WireAttr {
 
 #[proc_macro_attribute]
 pub fn provider(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
+    let mut func = parse_macro_input!(item as ItemFn);
+    
+    // Strip #[wire(...)] and #[bind(...)] attributes from parameters so they don't cause compile errors
+    // since they are only for build-time scanning.
+    for input in &mut func.sig.inputs {
+        if let syn::FnArg::Typed(pat_type) = input {
+            pat_type.attrs.retain(|attr| {
+                !attr.path().is_ident("wire") && !attr.path().is_ident("inject")
+            });
+        }
+    }
+    
+    quote! { #func }.into()
 }
 
 #[proc_macro_attribute]
@@ -122,16 +134,12 @@ pub fn wire(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
     
-    // Fuzzy matching
-    let is_match = |full: &str, suffix: &str| -> bool {
-        full == suffix || full.ends_with(&format!("::{}", suffix))
-    };
 
     let target_key = if graph.nodes.contains_key(&normalized_target) {
         normalized_target.clone()
     } else {
         graph.nodes.keys()
-            .find(|k| is_match(&normalized_target, k) || is_match(k, &normalized_target))
+            .find(|k| graph::is_match(&normalized_target, k) || graph::is_match(k, &normalized_target))
             .cloned()
             .unwrap_or(normalized_target.clone())
     };
@@ -165,14 +173,16 @@ pub fn wire(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let provider_path: Path = syn::parse_str(&provider.path).unwrap();
 
-        let args = provider.args.iter().map(|arg| {
-            let arg_ty_normalized = graph::normalize_type(&arg.ty, wrappers);
+        let mut arg_tokens = Vec::new();
+        for arg in &provider.args {
+            let lookup_ty = arg.from.as_ref().unwrap_or(&arg.ty);
+            let arg_ty_normalized = graph::normalize_type(lookup_ty, wrappers);
             
             let arg_key = if var_map.contains_key(&arg_ty_normalized) {
                 arg_ty_normalized
             } else {
                 var_map.keys()
-                    .find(|k| is_match(&arg_ty_normalized, k) || is_match(k, &arg_ty_normalized))
+                    .find(|k| graph::is_match(&arg_ty_normalized, k) || graph::is_match(k, &arg_ty_normalized))
                     .cloned()
                     .unwrap_or(arg_ty_normalized)
             };
@@ -195,20 +205,39 @@ pub fn wire(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
 
+            // THE FIX: If types are different and we don't just need a simple as_ref (like Arc<T> -> &T),
+            // OR if it's a Trait Object (contains 'dyn'), we need a local bridge to trigger Coersion.
+            let mut final_arg_var = quote! { #arg_var };
+            if !needs_as_ref && provider_ret_ty != arg_ty_clean && arg_ty_clean.contains("dyn") {
+                let bridge_name = format_ident!("{}_bridge_{}", arg_var, arg_tokens.len());
+                let expected_ty_base = if is_arg_ref {
+                    // Strip one '&'
+                    &arg.ty[1..]
+                } else {
+                    &arg.ty
+                };
+                let expected_ty: syn::Type = syn::parse_str(expected_ty_base).unwrap();
+                
+                generated_body.push(quote! {
+                    let #bridge_name: #expected_ty = #arg_var.clone();
+                });
+                final_arg_var = quote! { #bridge_name };
+            }
+
             if is_arg_ref {
                 if needs_as_ref {
-                    quote! { #arg_var.as_ref() }
+                    arg_tokens.push(quote! { #final_arg_var.as_ref() });
                 } else {
-                    quote! { &#arg_var }
+                    arg_tokens.push(quote! { &#final_arg_var });
                 }
             } else {
                 if needs_as_ref {
-                    quote! { #arg_var.as_ref().clone() }
+                    arg_tokens.push(quote! { #final_arg_var.as_ref().clone() });
                 } else {
-                    quote! { #arg_var.clone() }
+                    arg_tokens.push(quote! { #final_arg_var.clone() });
                 }
             }
-        });
+        }
 
         let try_op = if provider.is_result {
             if !is_target_result {
@@ -220,8 +249,22 @@ pub fn wire(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         generated_body.push(quote! {
-            let #var_name = #provider_path(#(#args),*) #try_op;
+            let #var_name = #provider_path(#(#arg_tokens),*) #try_op;
         });
+
+        for b in &provider.bindings {
+            let ty_b_normalized = graph::normalize_type(b, wrappers);
+            let b_type: syn::Type = syn::parse_str(b).unwrap();
+            let var_name_binding = format_ident!("{}_as_{}", var_base, ty_b_normalized);
+            
+            // Generate a bridging variable to trigger coercion
+            generated_body.push(quote! {
+                let #var_name_binding: #b_type = #var_name.clone();
+            });
+
+            var_map.insert(ty_b_normalized.clone(), var_name_binding);
+            actual_type_map.insert(ty_b_normalized, b.to_string());
+        }
     }
 
     let final_var = var_map

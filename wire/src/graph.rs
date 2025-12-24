@@ -12,6 +12,10 @@ pub struct Graph {
     pub edges: HashMap<String, Vec<String>>,
 }
 
+pub(crate) fn is_match(full: &str, suffix: &str) -> bool {
+    full == suffix || full.ends_with(&format!("_{}", suffix))
+}
+
 impl Graph {
     pub fn new(providers: &[ProviderInfo], wrappers: Vec<String>) -> std::result::Result<Self, String> {
         let mut graph = Graph::default();
@@ -21,6 +25,10 @@ impl Graph {
         for p in providers {
             let ty = normalize_type(&p.ret, &wrappers);
             type_to_providers.entry(ty).or_default().push(p.path.clone());
+            for b in &p.bindings {
+                let ty_b = normalize_type(b, &wrappers);
+                type_to_providers.entry(ty_b).or_default().push(p.path.clone());
+            }
         }
 
         let mut conflict_errors = Vec::new();
@@ -41,7 +49,10 @@ impl Graph {
         for p in providers {
             let ty = normalize_type(&p.ret, &wrappers);
             let dependencies: Vec<String> =
-                p.args.iter().map(|arg| normalize_type(&arg.ty, &wrappers)).collect();
+                p.args.iter().map(|arg| {
+                    let lookup_ty = arg.from.as_ref().unwrap_or(&arg.ty);
+                    normalize_type(lookup_ty, &wrappers)
+                }).collect();
 
             graph.nodes.insert(
                 ty.clone(),
@@ -49,8 +60,18 @@ impl Graph {
                     provider: p.clone(),
                 },
             );
+            graph.edges.insert(ty, dependencies.clone());
 
-            graph.edges.insert(ty, dependencies);
+            for b in &p.bindings {
+                let ty_b = normalize_type(b, &wrappers);
+                graph.nodes.insert(
+                    ty_b.clone(),
+                    Node {
+                        provider: p.clone(),
+                    },
+                );
+                graph.edges.insert(ty_b, dependencies.clone());
+            }
         }
 
         Ok(graph)
@@ -96,10 +117,18 @@ impl Graph {
         if visiting.contains(ty) {
             return Err(format!("Circular dependency detected on type: {}", ty));
         }
-        let node = self
-            .nodes
-            .get(ty)
-            .ok_or_else(|| format!("Missing provider for type: {}", ty))?;
+        let node = if let Some(n) = self.nodes.get(ty) {
+            n
+        } else {
+            // Fuzzy matching
+            let matched_key = self.nodes.keys()
+                .find(|k| is_match(ty, k) || is_match(k, ty))
+                .ok_or_else(|| {
+                    let available: Vec<_> = self.nodes.keys().cloned().collect();
+                    format!("Missing provider for type: {}. Available types: {:?}", ty, available)
+                })?;
+            self.nodes.get(matched_key).unwrap()
+        };
 
         visiting.insert(ty.to_string());
         if let Some(dependencies) = self.edges.get(ty) {
@@ -124,20 +153,34 @@ pub(crate) fn normalize_type(ty_str: &str, wrappers: &[String]) -> String {
     loop {
         let mut changed = false;
         for w in wrappers {
-            let prefix = format!("{}<", w);
-            if s.starts_with(&prefix) && s.ends_with(">") {
-                s = s[prefix.len()..s.len()-1].to_string();
-                changed = true;
-                break;
+            let search = format!("{}<", w);
+            if let Some(pos) = s.find(&search) {
+                if s.ends_with('>') {
+                    let prefix = &s[..pos];
+                    if prefix.is_empty() || prefix.ends_with("::") {
+                        s = s[pos + search.len()..s.len() - 1].to_string();
+                        changed = true;
+                        break;
+                    }
+                }
             }
         }
-        if !changed { break; }
+        if !changed {
+            break;
+        }
     }
 
-    s.replace("<", "_")
-     .replace(">", "_")
-     .replace("(", "_")
-     .replace(")", "_")
-     .replace(",", "_")
-     .to_lowercase()
+    s = s.replace("<", "_")
+         .replace(">", "_")
+         .replace("(", "_")
+         .replace(")", "_")
+         .replace(",", "_")
+         .replace("::", "_")
+         .to_lowercase();
+
+    if s.starts_with("dyn") {
+        s = s[3..].trim_start_matches('_').to_string();
+    }
+    s = s.replace("::dyn", "::");
+    s
 }
